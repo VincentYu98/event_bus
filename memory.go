@@ -32,11 +32,10 @@ func (m *MemoryTransport) Publish(ctx context.Context, topic string, data []byte
 	copy(handlers, m.handlers[topic])
 	m.mu.RUnlock()
 
-	// Copy data to prevent caller from reusing the buffer.
-	buf := make([]byte, len(data))
-	copy(buf, data)
-
+	// Copy data per handler to prevent both caller reuse and cross-handler mutation.
 	for _, h := range handlers {
+		buf := make([]byte, len(data))
+		copy(buf, data)
 		h(ctx, buf)
 	}
 	return nil
