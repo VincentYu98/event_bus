@@ -4,7 +4,7 @@ import (
 	"context"
 	"fmt"
 
-	"github.com/wepie/eventbus"
+	"github.com/vincentAlen/eventbus"
 )
 
 type ChatMessage struct {

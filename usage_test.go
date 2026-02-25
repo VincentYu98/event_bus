@@ -11,7 +11,7 @@ import (
 	"testing"
 	"time"
 
-	"github.com/wepie/eventbus"
+	"github.com/vincentAlen/eventbus"
 )
 
 // ============================================================

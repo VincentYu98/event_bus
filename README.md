@@ -25,7 +25,7 @@ eventbus.Publish(ctx, bus, UserLoginEvent{Uid: 123})
 ## 安装
 
 ```bash
-go get github.com/wepie/eventbus
+go get github.com/vincentAlen/eventbus
 ```
 
 要求 Go 1.21+。

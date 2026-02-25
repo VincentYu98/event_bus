@@ -1,3 +1,3 @@
-module github.com/wepie/eventbus
+module github.com/vincentAlen/eventbus
 
 go 1.21
