@@ -5,10 +5,11 @@ Go 泛型事件总线库 —— 类型安全、跨服务透明、零外部依赖
 ```go
 bus := eventbus.New()
 
-eventbus.Subscribe(bus, func(ctx context.Context, ev UserLoginEvent) error {
+sub := eventbus.Subscribe(bus, func(ctx context.Context, ev UserLoginEvent) error {
     log.Printf("user %d logged in", ev.Uid)
     return nil
 })
+defer sub.Close() // 不再需要时退订
 
 eventbus.Publish(ctx, bus, UserLoginEvent{Uid: 123})
 ```
@@ -21,6 +22,8 @@ eventbus.Publish(ctx, bus, UserLoginEvent{Uid: 123})
 - **传输层可插拔** — 内置 MemoryTransport；Redis / NATS 等作为独立 sub-module
 - **零外部依赖** — 核心模块仅使用标准库
 - **本地零序列化** — 本地 handler 直接接收 Go 对象，无序列化开销
+- **生命周期管理** — 支持退订（`Subscription.Close()`）和 Bus 关闭后拒绝新操作
+- **二进制 Codec** — 传输层 Payload 为 `[]byte`，Protobuf / MsgPack 等二进制编解码器可直接使用
 
 ## 安装
 
@@ -47,20 +50,26 @@ func (UserLoginEvent) Topic() string { return "user.login" }
 
 ### 2. 创建 Bus 并订阅
 
+`Subscribe` / `SubscribeLocal` 返回 `*Subscription`，可用于退订。
+
 ```go
 bus := eventbus.New()
 
 // 订阅：同时接收本地和远程事件
-eventbus.Subscribe(bus, func(ctx context.Context, ev UserLoginEvent) error {
+sub := eventbus.Subscribe(bus, func(ctx context.Context, ev UserLoginEvent) error {
     fmt.Printf("user %d logged in\n", ev.Uid)
     return nil
 })
 
 // 仅订阅本地事件
-eventbus.SubscribeLocal(bus, func(ctx context.Context, ev UserLoginEvent) error {
+localSub := eventbus.SubscribeLocal(bus, func(ctx context.Context, ev UserLoginEvent) error {
     // 只有本进程 Publish 的事件会触发
     return nil
 })
+
+// 不再需要时退订（Safe to call multiple times or on nil）
+sub.Close()
+localSub.Close()
 ```
 
 ### 3. 发布事件
@@ -100,14 +109,15 @@ eventbus.Publish(ctx, bus1, UserLoginEvent{Uid: 456})
 ```go
 bus := eventbus.New(
     eventbus.WithTransport(transport),    // 设置传输层
-    eventbus.WithCodec(myCodec),          // 自定义序列化（默认 JSON）
+    eventbus.WithCodec(myCodec),          // 自定义序列化（默认 JSON，支持二进制 Codec）
     eventbus.WithErrorHandler(func(err error) {  // 异步错误回调
         log.Println("eventbus error:", err)
     }),
+    eventbus.WithAsyncLimit(2048),        // PublishAsync 最大并发数（默认 4096）
 )
 ```
 
-## 核心接口
+## 核心接口与类型
 
 ### Event
 
@@ -115,6 +125,17 @@ bus := eventbus.New(
 type Event interface {
     Topic() string
 }
+```
+
+### Subscription
+
+`Subscribe` / `SubscribeLocal` 的返回值，用于退订。
+
+```go
+type Subscription struct{ /* unexported */ }
+
+// Close 移除 handler。可多次调用，nil 安全。
+func (s *Subscription) Close()
 ```
 
 ### Transport
@@ -129,11 +150,20 @@ type Transport interface {
 
 ### Codec
 
+`Codec` 输出的 `[]byte` 在传输层自动 base64 编码，因此 Protobuf / MsgPack 等二进制格式可直接使用。
+
 ```go
 type Codec interface {
     Marshal(v any) ([]byte, error)
     Unmarshal(data []byte, v any) error
 }
+```
+
+### 哨兵错误
+
+```go
+var ErrBusClosed       = errors.New("eventbus: bus closed")
+var ErrTransportClosed = errors.New("eventbus: transport closed")
 ```
 
 ## 内部机制
@@ -159,6 +189,29 @@ Publish[T](ctx, bus, event)
 - `Publish`（同步）：所有 handler 均执行，错误通过 `errors.Join` 聚合返回
 - `PublishAsync`（异步）：错误通过 `ErrorHandler` 回调上报
 - 单个 handler 出错不影响其他 handler 执行
+- Transport 订阅失败会通过 `ErrorHandler` 上报，并允许下次 `Subscribe` 重试
+- 远程消息 envelope 反序列化失败同样通过 `ErrorHandler` 上报（不再静默丢弃）
+
+### 生命周期
+
+```go
+bus := eventbus.New(eventbus.WithTransport(mt))
+
+// ... 使用 bus ...
+
+// 关闭后：Publish/PublishLocal 返回 ErrBusClosed，
+// Subscribe 返回 nil，PublishAsync 通过 ErrorHandler 上报错误。
+bus.Close()
+```
+
+### 背压
+
+`PublishAsync` 通过内置信号量限制并发 goroutine 数量（默认 4096）。达到上限时调用方阻塞，直到有槽位释放，防止 goroutine 膨胀。
+
+```go
+// 自定义上限
+bus := eventbus.New(eventbus.WithAsyncLimit(1024))
+```
 
 ## 项目结构
 
@@ -167,9 +220,9 @@ eventbus/
 ├── event.go          Event 接口
 ├── codec.go          Codec 接口 + JSONCodec
 ├── transport.go      Transport 接口 + ErrTransportClosed
-├── options.go        WithTransport / WithCodec / WithErrorHandler
-├── bus.go            Bus 核心实现
-├── subscribe.go      Subscribe[T] / SubscribeLocal[T]
+├── options.go        WithTransport / WithCodec / WithErrorHandler / WithAsyncLimit
+├── bus.go            Bus 核心实现 + Subscription 类型
+├── subscribe.go      Subscribe[T] / SubscribeLocal[T] → *Subscription
 ├── publish.go        Publish[T] / PublishAsync[T] / PublishLocal[T]
 ├── memory.go         MemoryTransport
 ├── bus_test.go       核心测试（13 cases）
