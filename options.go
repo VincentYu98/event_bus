@@ -20,3 +20,10 @@ func WithCodec(c Codec) Option {
 func WithErrorHandler(h ErrorHandler) Option {
 	return func(b *Bus) { b.errorHandler = h }
 }
+
+// WithAsyncLimit sets the maximum number of concurrent PublishAsync goroutines.
+// When the limit is reached, PublishAsync blocks until a slot is freed.
+// Default is 4096.
+func WithAsyncLimit(n int) Option {
+	return func(b *Bus) { b.asyncSem = make(chan struct{}, n) }
+}
