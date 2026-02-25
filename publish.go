@@ -9,17 +9,20 @@ import (
 // Publish sends an event of type T to all local handlers first,
 // then publishes to the Transport (if configured).
 // All local handlers are executed regardless of individual errors.
-// Returns ErrBusClosed if the Bus has been closed.
+// Returns ErrBusClosed if the Bus has been closed (checked under lock
+// for strong consistency with Close).
 func Publish[T Event](ctx context.Context, bus *Bus, event T) error {
-	if bus.closed.Load() {
-		return ErrBusClosed
-	}
-
 	topic := event.Topic()
+
+	// getLocalHandlers checks closed under RLock — no TOCTOU gap.
+	handlers, err := bus.getLocalHandlers(topic)
+	if err != nil {
+		return err
+	}
 
 	// Dispatch to local handlers.
 	var errs []error
-	for _, h := range bus.getLocalHandlers(topic) {
+	for _, h := range handlers {
 		if err := h.fn(ctx, event); err != nil {
 			errs = append(errs, err)
 		}
@@ -48,34 +51,36 @@ func Publish[T Event](ctx context.Context, bus *Bus, event T) error {
 }
 
 // PublishAsync sends an event asynchronously.
-// It acquires a semaphore slot (blocking if the concurrency limit is reached)
-// and launches a goroutine. Use WithAsyncLimit to configure the limit.
+// It acquires a semaphore slot and launches a goroutine.
+// Uses select with the Bus's done channel so it never blocks on a closed Bus.
 // If an error occurs and an ErrorHandler is configured, it is called.
 func PublishAsync[T Event](ctx context.Context, bus *Bus, event T) {
-	if bus.closed.Load() {
+	select {
+	case bus.asyncSem <- struct{}{}:
+		go func() {
+			defer func() { <-bus.asyncSem }()
+			if err := Publish(ctx, bus, event); err != nil {
+				bus.reportError(err)
+			}
+		}()
+	case <-bus.done:
 		bus.reportError(ErrBusClosed)
-		return
 	}
-	bus.asyncSem <- struct{}{} // backpressure: block if limit reached
-	go func() {
-		defer func() { <-bus.asyncSem }()
-		if err := Publish(ctx, bus, event); err != nil {
-			bus.reportError(err)
-		}
-	}()
 }
 
 // PublishLocal sends an event only to local handlers, bypassing the Transport.
-// Returns ErrBusClosed if the Bus has been closed.
+// Returns ErrBusClosed if the Bus has been closed (checked under lock
+// for strong consistency with Close).
 func PublishLocal[T Event](ctx context.Context, bus *Bus, event T) error {
-	if bus.closed.Load() {
-		return ErrBusClosed
-	}
-
 	topic := event.Topic()
 
+	handlers, err := bus.getLocalHandlers(topic)
+	if err != nil {
+		return err
+	}
+
 	var errs []error
-	for _, h := range bus.getLocalHandlers(topic) {
+	for _, h := range handlers {
 		if err := h.fn(ctx, event); err != nil {
 			errs = append(errs, err)
 		}

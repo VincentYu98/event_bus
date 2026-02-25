@@ -23,7 +23,12 @@ func WithErrorHandler(h ErrorHandler) Option {
 
 // WithAsyncLimit sets the maximum number of concurrent PublishAsync goroutines.
 // When the limit is reached, PublishAsync blocks until a slot is freed.
-// Default is 4096.
+// Values less than 1 are clamped to 1. Default is 4096.
 func WithAsyncLimit(n int) Option {
-	return func(b *Bus) { b.asyncSem = make(chan struct{}, n) }
+	return func(b *Bus) {
+		if n < 1 {
+			n = 1
+		}
+		b.asyncSem = make(chan struct{}, n)
+	}
 }

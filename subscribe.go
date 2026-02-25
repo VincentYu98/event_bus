@@ -8,18 +8,14 @@ import (
 // Subscribe registers a handler for events of type T.
 // The handler receives both local publishes and remote messages via Transport.
 // Returns a Subscription that can be closed to remove the handler.
-// Returns nil if the Bus is closed.
-func Subscribe[T Event](bus *Bus, handler func(ctx context.Context, ev T) error) *Subscription {
+// Returns an error if the Bus is closed or the Transport subscription fails
+// (after automatic retry).
+func Subscribe[T Event](bus *Bus, handler func(ctx context.Context, ev T) error) (*Subscription, error) {
 	var zero T
 	topic := zero.Topic()
 
-	if bus.closed.Load() {
-		bus.reportError(ErrBusClosed)
-		return nil
-	}
-
 	// Local handler: type-assert the in-process Go value (safe, no panic).
-	localID := bus.addLocalHandler(topic, localHandler{
+	localID, err := bus.addLocalHandler(topic, localHandler{
 		fn: func(ctx context.Context, v any) error {
 			ev, ok := v.(T)
 			if !ok {
@@ -28,9 +24,12 @@ func Subscribe[T Event](bus *Bus, handler func(ctx context.Context, ev T) error)
 			return handler(ctx, ev)
 		},
 	})
+	if err != nil {
+		return nil, err
+	}
 
 	// Remote handler: deserialize payload into T using the Bus's Codec.
-	remoteID := bus.addRemoteHandler(topic, remoteHandler{
+	remoteID, err := bus.addRemoteHandler(topic, remoteHandler{
 		fn: func(ctx context.Context, payload []byte) error {
 			var ev T
 			if err := bus.codec.Unmarshal(payload, &ev); err != nil {
@@ -39,29 +38,31 @@ func Subscribe[T Event](bus *Bus, handler func(ctx context.Context, ev T) error)
 			return handler(ctx, ev)
 		},
 	})
+	if err != nil {
+		// Rollback local handler on remote subscription failure.
+		bus.mu.Lock()
+		bus.localHandlers[topic] = removeLocalByID(bus.localHandlers[topic], localID)
+		bus.mu.Unlock()
+		return nil, err
+	}
 
 	return &Subscription{
 		bus:      bus,
 		topic:    topic,
 		localID:  localID,
 		remoteID: remoteID,
-	}
+	}, nil
 }
 
 // SubscribeLocal registers a handler for events of type T,
 // but only for events published locally (not from Transport).
 // Returns a Subscription that can be closed to remove the handler.
-// Returns nil if the Bus is closed.
-func SubscribeLocal[T Event](bus *Bus, handler func(ctx context.Context, ev T) error) *Subscription {
+// Returns an error if the Bus is closed.
+func SubscribeLocal[T Event](bus *Bus, handler func(ctx context.Context, ev T) error) (*Subscription, error) {
 	var zero T
 	topic := zero.Topic()
 
-	if bus.closed.Load() {
-		bus.reportError(ErrBusClosed)
-		return nil
-	}
-
-	localID := bus.addLocalHandler(topic, localHandler{
+	localID, err := bus.addLocalHandler(topic, localHandler{
 		fn: func(ctx context.Context, v any) error {
 			ev, ok := v.(T)
 			if !ok {
@@ -70,10 +71,13 @@ func SubscribeLocal[T Event](bus *Bus, handler func(ctx context.Context, ev T) e
 			return handler(ctx, ev)
 		},
 	})
+	if err != nil {
+		return nil, err
+	}
 
 	return &Subscription{
 		bus:     bus,
 		topic:   topic,
 		localID: localID,
-	}
+	}, nil
 }

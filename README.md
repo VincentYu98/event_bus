@@ -5,10 +5,11 @@ Go 泛型事件总线库 —— 类型安全、跨服务透明、零外部依赖
 ```go
 bus := eventbus.New()
 
-sub := eventbus.Subscribe(bus, func(ctx context.Context, ev UserLoginEvent) error {
+sub, err := eventbus.Subscribe(bus, func(ctx context.Context, ev UserLoginEvent) error {
     log.Printf("user %d logged in", ev.Uid)
     return nil
 })
+if err != nil { /* transport subscribe failed */ }
 defer sub.Close() // 不再需要时退订
 
 eventbus.Publish(ctx, bus, UserLoginEvent{Uid: 123})
@@ -50,19 +51,22 @@ func (UserLoginEvent) Topic() string { return "user.login" }
 
 ### 2. 创建 Bus 并订阅
 
-`Subscribe` / `SubscribeLocal` 返回 `*Subscription`，可用于退订。
+`Subscribe` / `SubscribeLocal` 返回 `(*Subscription, error)`。Transport 订阅失败会自动重试（最多 3 次，指数退避），若仍失败则返回 error。
 
 ```go
 bus := eventbus.New()
 
 // 订阅：同时接收本地和远程事件
-sub := eventbus.Subscribe(bus, func(ctx context.Context, ev UserLoginEvent) error {
+sub, err := eventbus.Subscribe(bus, func(ctx context.Context, ev UserLoginEvent) error {
     fmt.Printf("user %d logged in\n", ev.Uid)
     return nil
 })
+if err != nil {
+    log.Fatal("subscribe failed:", err) // transport 连续失败或 bus 已关闭
+}
 
 // 仅订阅本地事件
-localSub := eventbus.SubscribeLocal(bus, func(ctx context.Context, ev UserLoginEvent) error {
+localSub, _ := eventbus.SubscribeLocal(bus, func(ctx context.Context, ev UserLoginEvent) error {
     // 只有本进程 Publish 的事件会触发
     return nil
 })
@@ -132,6 +136,10 @@ type Event interface {
 `Subscribe` / `SubscribeLocal` 的返回值，用于退订。
 
 ```go
+// Subscribe 签名
+func Subscribe[T Event](bus *Bus, handler func(ctx context.Context, ev T) error) (*Subscription, error)
+func SubscribeLocal[T Event](bus *Bus, handler func(ctx context.Context, ev T) error) (*Subscription, error)
+
 type Subscription struct{ /* unexported */ }
 
 // Close 移除 handler。可多次调用，nil 安全。
@@ -189,10 +197,14 @@ Publish[T](ctx, bus, event)
 - `Publish`（同步）：所有 handler 均执行，错误通过 `errors.Join` 聚合返回
 - `PublishAsync`（异步）：错误通过 `ErrorHandler` 回调上报
 - 单个 handler 出错不影响其他 handler 执行
-- Transport 订阅失败会通过 `ErrorHandler` 上报，并允许下次 `Subscribe` 重试
+- Transport 订阅失败自动重试 3 次（指数退避），仍失败则通过 `error` 返回值和 `ErrorHandler` 双重上报
 - 远程消息 envelope 反序列化失败同样通过 `ErrorHandler` 上报（不再静默丢弃）
 
 ### 生命周期
+
+`Close` 与 `Subscribe` / `Publish` 的互斥通过 `sync.RWMutex` 保证——
+`Close` 在写锁内设置 `closed` 标志，而所有读/写操作均在锁内检查该标志，
+消除了 TOCTOU 窗口。
 
 ```go
 bus := eventbus.New(eventbus.WithTransport(mt))
@@ -200,13 +212,16 @@ bus := eventbus.New(eventbus.WithTransport(mt))
 // ... 使用 bus ...
 
 // 关闭后：Publish/PublishLocal 返回 ErrBusClosed，
-// Subscribe 返回 nil，PublishAsync 通过 ErrorHandler 上报错误。
+// Subscribe 返回 error，PublishAsync 通过 done channel 立即拒绝。
 bus.Close()
 ```
 
 ### 背压
 
-`PublishAsync` 通过内置信号量限制并发 goroutine 数量（默认 4096）。达到上限时调用方阻塞，直到有槽位释放，防止 goroutine 膨胀。
+`PublishAsync` 通过内置信号量限制并发 goroutine 数量（默认 4096）。
+达到上限时调用方阻塞，直到有槽位释放，防止 goroutine 膨胀。
+Bus 关闭时通过 `done` channel 立即唤醒阻塞中的 `PublishAsync`，不会永久挂起。
+`WithAsyncLimit` 会将 `n < 1` 钳位为 1，避免死锁或 panic。
 
 ```go
 // 自定义上限
@@ -222,7 +237,7 @@ eventbus/
 ├── transport.go      Transport 接口 + ErrTransportClosed
 ├── options.go        WithTransport / WithCodec / WithErrorHandler / WithAsyncLimit
 ├── bus.go            Bus 核心实现 + Subscription 类型
-├── subscribe.go      Subscribe[T] / SubscribeLocal[T] → *Subscription
+├── subscribe.go      Subscribe[T] / SubscribeLocal[T] → (*Subscription, error)
 ├── publish.go        Publish[T] / PublishAsync[T] / PublishLocal[T]
 ├── memory.go         MemoryTransport
 ├── bus_test.go       核心测试（13 cases）

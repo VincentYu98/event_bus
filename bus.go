@@ -8,10 +8,16 @@ import (
 	"fmt"
 	"sync"
 	"sync/atomic"
+	"time"
 )
 
 // ErrBusClosed is returned when operating on a closed Bus.
 var ErrBusClosed = errors.New("eventbus: bus closed")
+
+const (
+	defaultAsyncLimit   = 4096
+	maxSubscribeRetries = 3
+)
 
 // Subscription represents a registered event handler.
 // Call Close to remove the handler from the Bus.
@@ -58,19 +64,18 @@ type envelope struct {
 	Payload []byte `json:"payload"`
 }
 
-const defaultAsyncLimit = 4096
-
 // Bus is the central event dispatcher.
 type Bus struct {
 	id           string
 	codec        Codec
 	transport    Transport
 	errorHandler ErrorHandler
-	closed       atomic.Bool
 	nextID       atomic.Uint64
 	asyncSem     chan struct{}
 
 	mu             sync.RWMutex
+	closed         bool
+	done           chan struct{}
 	localHandlers  map[string][]localHandler
 	remoteHandlers map[string][]remoteHandler
 	subscribed     map[string]bool // tracks topics already subscribed on Transport
@@ -84,6 +89,7 @@ func New(opts ...Option) *Bus {
 		localHandlers:  make(map[string][]localHandler),
 		remoteHandlers: make(map[string][]remoteHandler),
 		subscribed:     make(map[string]bool),
+		done:           make(chan struct{}),
 		asyncSem:       make(chan struct{}, defaultAsyncLimit),
 	}
 	for _, opt := range opts {
@@ -97,10 +103,19 @@ func (b *Bus) ID() string {
 	return b.id
 }
 
-// Close shuts down the Bus. After Close, new Subscribe and Publish calls
-// will be rejected. In-flight asynchronous publishes may fail gracefully.
+// Close shuts down the Bus. After Close returns, new Subscribe and Publish
+// calls are guaranteed to be rejected. In-flight operations may complete
+// or fail gracefully.
 func (b *Bus) Close() error {
-	b.closed.Store(true)
+	b.mu.Lock()
+	if b.closed {
+		b.mu.Unlock()
+		return nil
+	}
+	b.closed = true
+	close(b.done)
+	b.mu.Unlock()
+
 	if b.transport != nil {
 		return b.transport.Close()
 	}
@@ -108,23 +123,32 @@ func (b *Bus) Close() error {
 }
 
 // addLocalHandler appends a local handler for the given topic and returns its ID.
-func (b *Bus) addLocalHandler(topic string, h localHandler) uint64 {
+// Returns ErrBusClosed if the Bus has been closed.
+func (b *Bus) addLocalHandler(topic string, h localHandler) (uint64, error) {
 	id := b.nextID.Add(1)
 	h.id = id
 	b.mu.Lock()
 	defer b.mu.Unlock()
+	if b.closed {
+		return 0, ErrBusClosed
+	}
 	b.localHandlers[topic] = append(b.localHandlers[topic], h)
-	return id
+	return id, nil
 }
 
 // addRemoteHandler appends a remote handler for the given topic and returns its ID.
-// On the first remote handler for a topic, it subscribes on the Transport.
+// On the first remote handler for a topic, it subscribes on the Transport with retry.
 // The Bus lock is released before calling transport.Subscribe to avoid deadlock.
-func (b *Bus) addRemoteHandler(topic string, h remoteHandler) uint64 {
+// Returns ErrBusClosed if the Bus has been closed.
+func (b *Bus) addRemoteHandler(topic string, h remoteHandler) (uint64, error) {
 	id := b.nextID.Add(1)
 	h.id = id
 
 	b.mu.Lock()
+	if b.closed {
+		b.mu.Unlock()
+		return 0, ErrBusClosed
+	}
 	b.remoteHandlers[topic] = append(b.remoteHandlers[topic], h)
 
 	needSubscribe := b.transport != nil && !b.subscribed[topic]
@@ -138,11 +162,11 @@ func (b *Bus) addRemoteHandler(topic string, h remoteHandler) uint64 {
 	b.mu.Unlock()
 
 	if !needSubscribe {
-		return id
+		return id, nil
 	}
 
-	// Subscribe on Transport without holding the Bus lock.
-	err := t.Subscribe(topic, func(ctx context.Context, data []byte) {
+	// Subscribe on Transport without holding the Bus lock, with retry.
+	callback := func(ctx context.Context, data []byte) {
 		var env envelope
 		if err := json.Unmarshal(data, &env); err != nil {
 			b.reportError(fmt.Errorf("eventbus: unmarshal envelope: %w", err))
@@ -153,6 +177,10 @@ func (b *Bus) addRemoteHandler(topic string, h remoteHandler) uint64 {
 			return
 		}
 		b.mu.RLock()
+		if b.closed {
+			b.mu.RUnlock()
+			return
+		}
 		handlers := make([]remoteHandler, len(b.remoteHandlers[topic]))
 		copy(handlers, b.remoteHandlers[topic])
 		b.mu.RUnlock()
@@ -162,26 +190,56 @@ func (b *Bus) addRemoteHandler(topic string, h remoteHandler) uint64 {
 				b.reportError(err)
 			}
 		}
-	})
-
-	if err != nil {
-		// Revert subscribed flag so the next Subscribe call retries.
-		b.mu.Lock()
-		b.subscribed[topic] = false
-		b.mu.Unlock()
-		b.reportError(fmt.Errorf("eventbus: transport subscribe: %w", err))
 	}
 
-	return id
+	err := b.subscribeWithRetry(t, topic, callback)
+	if err != nil {
+		// Rollback: revert subscribed flag and remove the handler.
+		b.mu.Lock()
+		b.subscribed[topic] = false
+		b.remoteHandlers[topic] = removeRemoteByID(b.remoteHandlers[topic], id)
+		b.mu.Unlock()
+
+		wrappedErr := fmt.Errorf("eventbus: transport subscribe: %w", err)
+		b.reportError(wrappedErr)
+		return 0, wrappedErr
+	}
+
+	return id, nil
+}
+
+// subscribeWithRetry attempts transport.Subscribe up to maxSubscribeRetries times
+// with exponential backoff (20ms, 40ms). Aborts early if the Bus is closed.
+func (b *Bus) subscribeWithRetry(t Transport, topic string, handler func(ctx context.Context, data []byte)) error {
+	var err error
+	for attempt := 0; attempt < maxSubscribeRetries; attempt++ {
+		if attempt > 0 {
+			delay := time.Duration(1<<uint(attempt)) * 10 * time.Millisecond
+			select {
+			case <-time.After(delay):
+			case <-b.done:
+				return ErrBusClosed
+			}
+		}
+		if err = t.Subscribe(topic, handler); err == nil {
+			return nil
+		}
+	}
+	return err
 }
 
 // getLocalHandlers returns a snapshot of local handlers for the given topic.
-func (b *Bus) getLocalHandlers(topic string) []localHandler {
+// Returns ErrBusClosed if the Bus has been closed (checked under RLock
+// for strong consistency with Close).
+func (b *Bus) getLocalHandlers(topic string) ([]localHandler, error) {
 	b.mu.RLock()
 	defer b.mu.RUnlock()
+	if b.closed {
+		return nil, ErrBusClosed
+	}
 	handlers := make([]localHandler, len(b.localHandlers[topic]))
 	copy(handlers, b.localHandlers[topic])
-	return handlers
+	return handlers, nil
 }
 
 // reportError calls the configured ErrorHandler, if any.
