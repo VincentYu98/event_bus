@@ -64,6 +64,11 @@ type envelope struct {
 	Payload []byte `json:"payload"`
 }
 
+type subscribeState struct {
+	done chan struct{}
+	err  error
+}
+
 // Bus is the central event dispatcher.
 type Bus struct {
 	id           string
@@ -79,6 +84,7 @@ type Bus struct {
 	localHandlers  map[string][]localHandler
 	remoteHandlers map[string][]remoteHandler
 	subscribed     map[string]bool // tracks topics already subscribed on Transport
+	subscribing    map[string]*subscribeState
 }
 
 // New creates a new Bus with the given options.
@@ -89,6 +95,7 @@ func New(opts ...Option) *Bus {
 		localHandlers:  make(map[string][]localHandler),
 		remoteHandlers: make(map[string][]remoteHandler),
 		subscribed:     make(map[string]bool),
+		subscribing:    make(map[string]*subscribeState),
 		done:           make(chan struct{}),
 		asyncSem:       make(chan struct{}, defaultAsyncLimit),
 	}
@@ -138,74 +145,101 @@ func (b *Bus) addLocalHandler(topic string, h localHandler) (uint64, error) {
 
 // addRemoteHandler appends a remote handler for the given topic and returns its ID.
 // On the first remote handler for a topic, it subscribes on the Transport with retry.
-// The Bus lock is released before calling transport.Subscribe to avoid deadlock.
+// Concurrent first-subscriber calls are serialized by topic so no caller can return
+// success before the Transport subscription is actually established.
 // Returns ErrBusClosed if the Bus has been closed.
 func (b *Bus) addRemoteHandler(topic string, h remoteHandler) (uint64, error) {
 	id := b.nextID.Add(1)
 	h.id = id
 
-	b.mu.Lock()
-	if b.closed {
-		b.mu.Unlock()
-		return 0, ErrBusClosed
-	}
-	b.remoteHandlers[topic] = append(b.remoteHandlers[topic], h)
-
-	needSubscribe := b.transport != nil && !b.subscribed[topic]
-	var t Transport
-	var busID string
-	if needSubscribe {
-		b.subscribed[topic] = true // prevent concurrent double-subscribe
-		t = b.transport
-		busID = b.id
-	}
-	b.mu.Unlock()
-
-	if !needSubscribe {
-		return id, nil
-	}
-
-	// Subscribe on Transport without holding the Bus lock, with retry.
-	callback := func(ctx context.Context, data []byte) {
-		var env envelope
-		if err := json.Unmarshal(data, &env); err != nil {
-			b.reportError(fmt.Errorf("eventbus: unmarshal envelope: %w", err))
-			return
-		}
-		// Skip messages originating from this Bus (dedup).
-		if env.Origin == busID {
-			return
-		}
-		b.mu.RLock()
+	for {
+		b.mu.Lock()
 		if b.closed {
-			b.mu.RUnlock()
-			return
+			b.mu.Unlock()
+			return 0, ErrBusClosed
 		}
-		handlers := make([]remoteHandler, len(b.remoteHandlers[topic]))
-		copy(handlers, b.remoteHandlers[topic])
-		b.mu.RUnlock()
 
-		for _, rh := range handlers {
-			if err := rh.fn(ctx, env.Payload); err != nil {
-				b.reportError(err)
+		// Transport is optional; without it, keep remote handler for consistency.
+		if b.transport == nil || b.subscribed[topic] {
+			b.remoteHandlers[topic] = append(b.remoteHandlers[topic], h)
+			b.mu.Unlock()
+			return id, nil
+		}
+
+		// Another goroutine is currently establishing the topic subscription.
+		if state, ok := b.subscribing[topic]; ok {
+			done := state.done
+			b.mu.Unlock()
+
+			select {
+			case <-done:
+			case <-b.done:
+				return 0, ErrBusClosed
+			}
+			if state.err != nil {
+				return 0, state.err
+			}
+			// Subscribed by another goroutine; append handler on next loop.
+			continue
+		}
+
+		// Become the topic subscription leader.
+		state := &subscribeState{done: make(chan struct{})}
+		b.subscribing[topic] = state
+		t := b.transport
+		busID := b.id
+		b.mu.Unlock()
+
+		// Subscribe on Transport without holding the Bus lock.
+		callback := func(ctx context.Context, data []byte) {
+			var env envelope
+			if err := json.Unmarshal(data, &env); err != nil {
+				b.reportError(fmt.Errorf("eventbus: unmarshal envelope: %w", err))
+				return
+			}
+			// Skip messages originating from this Bus (dedup).
+			if env.Origin == busID {
+				return
+			}
+			b.mu.RLock()
+			if b.closed {
+				b.mu.RUnlock()
+				return
+			}
+			handlers := make([]remoteHandler, len(b.remoteHandlers[topic]))
+			copy(handlers, b.remoteHandlers[topic])
+			b.mu.RUnlock()
+
+			for _, rh := range handlers {
+				if err := rh.fn(ctx, env.Payload); err != nil {
+					b.reportError(err)
+				}
 			}
 		}
-	}
 
-	err := b.subscribeWithRetry(t, topic, callback)
-	if err != nil {
-		// Rollback: revert subscribed flag and remove the handler.
+		err := b.subscribeWithRetry(t, topic, callback)
+		if err != nil {
+			err = fmt.Errorf("eventbus: transport subscribe: %w", err)
+		}
+
 		b.mu.Lock()
-		b.subscribed[topic] = false
-		b.remoteHandlers[topic] = removeRemoteByID(b.remoteHandlers[topic], id)
+		if err == nil && !b.closed {
+			b.subscribed[topic] = true
+			b.remoteHandlers[topic] = append(b.remoteHandlers[topic], h)
+		} else if err == nil {
+			err = ErrBusClosed
+		}
+		state.err = err
+		delete(b.subscribing, topic)
+		close(state.done)
 		b.mu.Unlock()
 
-		wrappedErr := fmt.Errorf("eventbus: transport subscribe: %w", err)
-		b.reportError(wrappedErr)
-		return 0, wrappedErr
+		if err != nil {
+			b.reportError(err)
+			return 0, err
+		}
+		return id, nil
 	}
-
-	return id, nil
 }
 
 // subscribeWithRetry attempts transport.Subscribe up to maxSubscribeRetries times

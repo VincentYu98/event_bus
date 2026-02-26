@@ -14,20 +14,6 @@ func Subscribe[T Event](bus *Bus, handler func(ctx context.Context, ev T) error)
 	var zero T
 	topic := zero.Topic()
 
-	// Local handler: type-assert the in-process Go value (safe, no panic).
-	localID, err := bus.addLocalHandler(topic, localHandler{
-		fn: func(ctx context.Context, v any) error {
-			ev, ok := v.(T)
-			if !ok {
-				return fmt.Errorf("eventbus: type assertion failed: expected %T, got %T", zero, v)
-			}
-			return handler(ctx, ev)
-		},
-	})
-	if err != nil {
-		return nil, err
-	}
-
 	// Remote handler: deserialize payload into T using the Bus's Codec.
 	remoteID, err := bus.addRemoteHandler(topic, remoteHandler{
 		fn: func(ctx context.Context, payload []byte) error {
@@ -39,9 +25,23 @@ func Subscribe[T Event](bus *Bus, handler func(ctx context.Context, ev T) error)
 		},
 	})
 	if err != nil {
-		// Rollback local handler on remote subscription failure.
+		return nil, err
+	}
+
+	// Local handler: type-assert the in-process Go value (safe, no panic).
+	localID, err := bus.addLocalHandler(topic, localHandler{
+		fn: func(ctx context.Context, v any) error {
+			ev, ok := v.(T)
+			if !ok {
+				return fmt.Errorf("eventbus: type assertion failed: expected %T, got %T", zero, v)
+			}
+			return handler(ctx, ev)
+		},
+	})
+	if err != nil {
+		// Rollback remote handler on local registration failure.
 		bus.mu.Lock()
-		bus.localHandlers[topic] = removeLocalByID(bus.localHandlers[topic], localID)
+		bus.remoteHandlers[topic] = removeRemoteByID(bus.remoteHandlers[topic], remoteID)
 		bus.mu.Unlock()
 		return nil, err
 	}

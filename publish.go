@@ -56,7 +56,23 @@ func Publish[T Event](ctx context.Context, bus *Bus, event T) error {
 // If an error occurs and an ErrorHandler is configured, it is called.
 func PublishAsync[T Event](ctx context.Context, bus *Bus, event T) {
 	select {
+	case <-bus.done:
+		bus.reportError(ErrBusClosed)
+		return
+	default:
+	}
+
+	select {
 	case bus.asyncSem <- struct{}{}:
+		// Close may happen between the fast-path check and this enqueue.
+		// If so, release the slot and reject immediately.
+		select {
+		case <-bus.done:
+			<-bus.asyncSem
+			bus.reportError(ErrBusClosed)
+			return
+		default:
+		}
 		go func() {
 			defer func() { <-bus.asyncSem }()
 			if err := Publish(ctx, bus, event); err != nil {

@@ -3,6 +3,7 @@ package eventbus
 import (
 	"context"
 	"errors"
+	"runtime"
 	"sync"
 	"sync/atomic"
 	"testing"
@@ -22,6 +23,43 @@ type OrderPlaced struct {
 }
 
 func (OrderPlaced) Topic() string { return "order.placed" }
+
+type controlledFailSubscribeTransport struct {
+	mu           sync.Mutex
+	subCalls     int
+	firstStarted chan struct{}
+	releaseFirst chan struct{}
+}
+
+func newControlledFailSubscribeTransport() *controlledFailSubscribeTransport {
+	return &controlledFailSubscribeTransport{
+		firstStarted: make(chan struct{}),
+		releaseFirst: make(chan struct{}),
+	}
+}
+
+func (t *controlledFailSubscribeTransport) Publish(ctx context.Context, topic string, data []byte) error {
+	return nil
+}
+
+func (t *controlledFailSubscribeTransport) Subscribe(topic string, handler func(ctx context.Context, data []byte)) error {
+	t.mu.Lock()
+	t.subCalls++
+	callNum := t.subCalls
+	firstStarted := t.firstStarted
+	releaseFirst := t.releaseFirst
+	t.mu.Unlock()
+
+	if callNum == 1 {
+		close(firstStarted)
+		<-releaseFirst
+	}
+	return errors.New("subscribe failed")
+}
+
+func (t *controlledFailSubscribeTransport) Close() error {
+	return nil
+}
 
 // --- tests ---
 
@@ -276,5 +314,112 @@ func TestClose(t *testing.T) {
 	err := mt.Publish(context.Background(), "test", []byte("data"))
 	if !errors.Is(err, ErrTransportClosed) {
 		t.Fatalf("expected ErrTransportClosed, got %v", err)
+	}
+}
+
+func TestSubscribeConcurrentFailure_NoPhantomSuccess(t *testing.T) {
+	tr := newControlledFailSubscribeTransport()
+	bus := New(WithTransport(tr))
+
+	h := func(ctx context.Context, ev UserCreated) error { return nil }
+	err1Ch := make(chan error, 1)
+	err2Ch := make(chan error, 1)
+
+	go func() {
+		_, err := Subscribe[UserCreated](bus, h)
+		err1Ch <- err
+	}()
+
+	<-tr.firstStarted
+
+	go func() {
+		_, err := Subscribe[UserCreated](bus, h)
+		err2Ch <- err
+	}()
+
+	close(tr.releaseFirst)
+
+	err1 := <-err1Ch
+	err2 := <-err2Ch
+	if err1 == nil {
+		t.Fatal("first subscribe should fail")
+	}
+	if err2 == nil {
+		t.Fatal("second concurrent subscribe should also fail; must not return phantom success")
+	}
+
+	topic := (UserCreated{}).Topic()
+	bus.mu.RLock()
+	remoteCount := len(bus.remoteHandlers[topic])
+	subscribed := bus.subscribed[topic]
+	bus.mu.RUnlock()
+	if remoteCount != 0 {
+		t.Fatalf("expected no remote handlers after subscribe failures, got %d", remoteCount)
+	}
+	if subscribed {
+		t.Fatal("topic should not be marked subscribed after subscribe failures")
+	}
+}
+
+func TestSubscribeFailure_DoesNotExposeLocalHandler(t *testing.T) {
+	tr := newControlledFailSubscribeTransport()
+	bus := New(WithTransport(tr))
+
+	var called atomic.Int32
+	errCh := make(chan error, 1)
+
+	go func() {
+		_, err := Subscribe[UserCreated](bus, func(ctx context.Context, ev UserCreated) error {
+			called.Add(1)
+			return nil
+		})
+		errCh <- err
+	}()
+
+	<-tr.firstStarted
+
+	if err := PublishLocal(context.Background(), bus, UserCreated{Name: "should-not-hit"}); err != nil {
+		t.Fatalf("unexpected publish error: %v", err)
+	}
+	if called.Load() != 0 {
+		t.Fatalf("handler should not be visible before Subscribe returns success, got %d calls", called.Load())
+	}
+
+	close(tr.releaseFirst)
+	if err := <-errCh; err == nil {
+		t.Fatal("subscribe should fail")
+	}
+	if called.Load() != 0 {
+		t.Fatalf("handler should remain unregistered after subscribe failure, got %d calls", called.Load())
+	}
+}
+
+func TestPublishAsync_ClosedBusDoesNotQueue(t *testing.T) {
+	prev := runtime.GOMAXPROCS(1)
+	defer runtime.GOMAXPROCS(prev)
+
+	var closedErrs atomic.Int32
+	bus := New(
+		WithAsyncLimit(1),
+		WithErrorHandler(func(err error) {
+			if errors.Is(err, ErrBusClosed) {
+				closedErrs.Add(1)
+			}
+		}),
+	)
+	if err := bus.Close(); err != nil {
+		t.Fatalf("close failed: %v", err)
+	}
+
+	const n = 200
+	for i := 0; i < n; i++ {
+		PublishAsync(context.Background(), bus, UserCreated{Name: "x"})
+		if q := len(bus.asyncSem); q != 0 {
+			t.Fatalf("closed bus should not queue async work, len(asyncSem)=%d at iter=%d", q, i)
+		}
+	}
+
+	if closedErrs.Load() != n {
+		t.Fatalf("expected %d ErrBusClosed reports, got %d", n, closedErrs.Load())
 	}
 }
